@@ -1,0 +1,425 @@
+/* ROM patcher — IPS, UPS, BPS, xdelta3/VCDIFF (incl. LZMA secondary compression). Pure JS, on-device. */
+const Patcher = (() => {
+
+  /* ---------- CRC32 ---------- */
+  const CRC_TABLE = (() => {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  })();
+  function crc32(u8) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  /* ---------- IPS ---------- */
+  function applyIPS(romBuf, patchBuf) {
+    const rom = new Uint8Array(romBuf), p = new Uint8Array(patchBuf);
+    if (String.fromCharCode(...p.subarray(0, 5)) !== "PATCH") throw new Error("Not a valid IPS patch");
+    let i = 5, maxEnd = rom.length, records = [];
+    while (i < p.length) {
+      if (p[i] === 0x45 && p[i+1] === 0x4F && p[i+2] === 0x46) { i += 3; break; } // EOF
+      const off = (p[i] << 16) | (p[i+1] << 8) | p[i+2]; i += 3;
+      let size = (p[i] << 8) | p[i+1]; i += 2;
+      if (size === 0) { // RLE
+        const rle = (p[i] << 8) | p[i+1]; i += 2;
+        const val = p[i]; i += 1;
+        records.push({ off, rle, val });
+        maxEnd = Math.max(maxEnd, off + rle);
+      } else {
+        records.push({ off, data: p.subarray(i, i + size) });
+        maxEnd = Math.max(maxEnd, off + size);
+        i += size;
+      }
+    }
+    let truncate = null;
+    if (i + 3 <= p.length) truncate = (p[i] << 16) | (p[i+1] << 8) | p[i+2];
+    const outLen = truncate !== null ? truncate : maxEnd;
+    const out = new Uint8Array(outLen);
+    out.set(rom.subarray(0, Math.min(rom.length, outLen)));
+    for (const r of records) {
+      if (r.data) out.set(r.data, r.off);
+      else out.fill(r.val, r.off, r.off + r.rle);
+    }
+    return out.buffer;
+  }
+
+  /* ---------- UPS ---------- */
+  function readVarint(p, st) {
+    let data = 0, shift = 1;
+    for (;;) {
+      const x = p[st.i++];
+      data += (x & 0x7F) * shift;
+      if (x & 0x80) break;
+      shift *= 128;
+      data += shift;
+    }
+    return data;
+  }
+  function applyUPS(romBuf, patchBuf) {
+    const rom = new Uint8Array(romBuf), p = new Uint8Array(patchBuf);
+    if (String.fromCharCode(...p.subarray(0, 4)) !== "UPS1") throw new Error("Not a valid UPS patch");
+    const st = { i: 4 };
+    const inSize = readVarint(p, st), outSize = readVarint(p, st);
+    const dv = new DataView(patchBuf);
+    const crcIn = dv.getUint32(p.length - 12, true);
+    const crcOut = dv.getUint32(p.length - 8, true);
+    const warn = [];
+    if (rom.length !== inSize && rom.length !== outSize) warn.push(`ROM size ${rom.length} not equal to expected ${inSize}`);
+    const romCrc = crc32(rom);
+    if (romCrc !== crcIn && romCrc !== crcOut) warn.push("ROM checksum doesn't match the patch (wrong base ROM or wrong version?)");
+    const out = new Uint8Array(outSize);
+    out.set(rom.subarray(0, Math.min(rom.length, outSize)));
+    let o = 0;
+    const end = p.length - 12;
+    while (st.i < end) {
+      o += readVarint(p, st);
+      while (st.i < end) {
+        const b = p[st.i++];
+        if (b === 0) break;
+        if (o < outSize) out[o] ^= b;
+        o++;
+      }
+      o++;
+    }
+    if (crc32(out) !== crcOut) warn.push("Output checksum mismatch — patched ROM may be unusable.");
+    return { buffer: out.buffer, warnings: warn };
+  }
+
+  /* ---------- BPS ---------- */
+  function applyBPS(romBuf, patchBuf) {
+    const src = new Uint8Array(romBuf), p = new Uint8Array(patchBuf);
+    if (String.fromCharCode(...p.subarray(0, 4)) !== "BPS1") throw new Error("Not a valid BPS patch");
+    const st = { i: 4 };
+    const srcSize = readVarint(p, st), tgtSize = readVarint(p, st), metaSize = readVarint(p, st);
+    st.i += metaSize;
+    const dv = new DataView(patchBuf);
+    const crcSrc = dv.getUint32(p.length - 12, true);
+    const crcTgt = dv.getUint32(p.length - 8, true);
+    const warn = [];
+    if (src.length !== srcSize) warn.push(`ROM size ${src.length} not equal to expected ${srcSize}`);
+    if (crc32(src) !== crcSrc) warn.push("ROM checksum doesn't match the patch (wrong base ROM or wrong version?)");
+    const out = new Uint8Array(tgtSize);
+    let o = 0, srcRel = 0, tgtRel = 0;
+    const end = p.length - 12;
+    while (st.i < end) {
+      const data = readVarint(p, st);
+      const cmd = data & 3, len = (data >> 2) + 1;
+      if (cmd === 0) {            // SourceRead
+        for (let j = 0; j < len; j++) { out[o] = src[o]; o++; }
+      } else if (cmd === 1) {     // TargetRead
+        for (let j = 0; j < len; j++) out[o++] = p[st.i++];
+      } else if (cmd === 2) {     // SourceCopy
+        const d = readVarint(p, st);
+        srcRel += (d & 1 ? -1 : 1) * (d >> 1);
+        for (let j = 0; j < len; j++) out[o++] = src[srcRel++];
+      } else {                    // TargetCopy
+        const d = readVarint(p, st);
+        tgtRel += (d & 1 ? -1 : 1) * (d >> 1);
+        for (let j = 0; j < len; j++) out[o++] = out[tgtRel++];
+      }
+    }
+    if (crc32(out) !== crcTgt) warn.push("Output checksum mismatch — patched ROM may be unusable.");
+    return { buffer: out.buffer, warnings: warn };
+  }
+
+  /* ---------- xdelta3 / VCDIFF (RFC 3284) ---------- */
+
+  // VCDIFF varint: base-128 big-endian, high bit = continuation
+  function vcdInt(buf, st) {
+    let v = 0;
+    for (;;) {
+      const b = buf[st.i++];
+      v = (v * 128) + (b & 0x7F);
+      if (!(b & 0x80)) return v;
+      if (st.i > buf.length) throw new Error("Corrupt VCDIFF varint");
+    }
+  }
+
+  // Default instruction code table (RFC 3284 sec 5.6). Types: 0=NOOP 1=ADD 2=RUN 3=COPY
+  const VCD_TABLE = (() => {
+    const t = [];
+    const e = (t1, s1, m1, t2, s2, m2) => t.push([t1, s1, m1, t2, s2, m2]);
+    e(2, 0, 0, 0, 0, 0);                                        // 0: RUN
+    for (let s = 0; s <= 17; s++) e(1, s, 0, 0, 0, 0);          // 1-18: ADD 0,[1,17]
+    for (let m = 0; m <= 8; m++) {                               // 19-162: COPY 0,[4,18] x mode
+      e(3, 0, m, 0, 0, 0);
+      for (let s = 4; s <= 18; s++) e(3, s, m, 0, 0, 0);
+    }
+    for (let m = 0; m <= 5; m++)                                 // 163-234: ADD[1,4]+COPY[4,6]
+      for (let sa = 1; sa <= 4; sa++)
+        for (let sc = 4; sc <= 6; sc++) e(1, sa, 0, 3, sc, m);
+    for (let m = 6; m <= 8; m++)                                 // 235-246: ADD[1,4]+COPY 4
+      for (let sa = 1; sa <= 4; sa++) e(1, sa, 0, 3, 4, m);
+    for (let m = 0; m <= 8; m++) e(3, 4, m, 1, 1, 0);           // 247-255: COPY 4+ADD 1
+    return t;
+  })();
+
+  function adler32(u8) {
+    let a = 1, b = 0;
+    for (let i = 0; i < u8.length; i++) { a = (a + u8[i]) % 65521; b = (b + a) % 65521; }
+    return ((b << 16) | a) >>> 0;
+  }
+
+  function flatten(chunks, total) {
+    if (chunks.length === 1) return chunks[0];
+    const all = new Uint8Array(total);
+    let o = 0;
+    for (const c of chunks) { all.set(c, o); o += c.length; }
+    chunks.length = 0; chunks.push(all);
+    return all;
+  }
+
+  // Concatenate an array of Uint8Arrays into one
+  function cat(arrs) {
+    let total = 0;
+    for (const a of arrs) total += a.length;
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const a of arrs) { out.set(a, off); off += a.length; }
+    return out;
+  }
+
+  // Apply one VCDIFF window given already-decoded data/inst/addr byte arrays
+  function applyWindow(src, dataBytes, instBytes, addrBytes, srcSegLen, srcSegPos, fromSource, fromTarget, tgtLen, winAdler, out, outLen, warn) {
+    let seg = null;
+    if (fromSource) seg = src.subarray(srcSegPos, srcSegPos + srcSegLen);
+    else if (fromTarget) seg = flatten(out, outLen).subarray(srcSegPos, srcSegPos + srcSegLen);
+
+    const tgt = new Uint8Array(tgtLen);
+    let o = 0;
+    const dataS = { i: 0 }, instS = { i: 0 }, addrS = { i: 0 };
+    const instEnd = instBytes.length;
+
+    const near = [0, 0, 0, 0]; let nextNear = 0;
+    const same = new Array(3 * 256).fill(0);
+    const cacheUpdate = a => { near[nextNear] = a; nextNear = (nextNear + 1) % 4; same[a % (3 * 256)] = a; };
+    const decodeAddr = (here, mode) => {
+      let a;
+      if (mode === 0) a = vcdInt(addrBytes, addrS);
+      else if (mode === 1) a = here - vcdInt(addrBytes, addrS);
+      else if (mode <= 5) a = near[mode - 2] + vcdInt(addrBytes, addrS);
+      else a = same[(mode - 6) * 256 + addrBytes[addrS.i++]];
+      cacheUpdate(a);
+      return a;
+    };
+    const doInst = (type, size, mode) => {
+      if (type === 0) return;
+      if (size === 0) size = vcdInt(instBytes, instS);
+      if (type === 1) {            // ADD
+        for (let j = 0; j < size; j++) tgt[o++] = dataBytes[dataS.i++];
+      } else if (type === 2) {     // RUN
+        const b = dataBytes[dataS.i++];
+        for (let j = 0; j < size; j++) tgt[o++] = b;
+      } else {                     // COPY
+        const here = srcSegLen + o;
+        let a = decodeAddr(here, mode);
+        for (let j = 0; j < size; j++) {
+          tgt[o++] = a < srcSegLen ? seg[a] : tgt[a - srcSegLen];
+          a++;
+        }
+      }
+    };
+    while (instS.i < instEnd) {
+      const idx = instBytes[instS.i++];
+      const ent = VCD_TABLE[idx];
+      doInst(ent[0], ent[1], ent[2]);
+      doInst(ent[3], ent[4], ent[5]);
+    }
+    if (o !== tgtLen) warn.push(`Window produced ${o} of ${tgtLen} expected bytes`);
+    if (winAdler !== null && adler32(tgt) !== winAdler)
+      warn.push("Adler-32 window checksum mismatch — wrong base ROM?");
+    return tgt;
+  }
+
+  // ---- LZMA/XZ secondary compression path (two-pass) ----
+  // xz-decompress loaded on demand from CDN; only needed once per session
+  let _xzDecompress = null;
+  async function loadXz() {
+    if (_xzDecompress) return _xzDecompress;
+    try {
+      const mod = await import("https://cdn.jsdelivr.net/npm/xz-decompress/+esm");
+      _xzDecompress = mod.decompress;
+      return _xzDecompress;
+    } catch (_) {}
+    try {
+      const mod = await import("https://esm.sh/xz-decompress");
+      _xzDecompress = mod.decompress;
+      return _xzDecompress;
+    } catch (e) {
+      throw new Error("Could not load LZMA decompressor. Make sure you're online for the first .xdelta patch with LZMA compression. (" + e.message + ")");
+    }
+  }
+
+  async function applyXDeltaLZMA(src, p, winStart, warn) {
+    const decompress = await loadXz();
+
+    // === PASS 1: scan all windows, collect raw XZ bytes per section type ===
+    const metas = [];
+    const cData = [], cInst = [], cAddr = []; // raw compressed chunks
+
+    const st = { i: winStart };
+    while (st.i < p.length) {
+      const winInd = p[st.i++];
+      let srcSegLen = 0, srcSegPos = 0, fromSource = false, fromTarget = false;
+      if (winInd & 0x01) { fromSource = true; srcSegLen = vcdInt(p, st); srcSegPos = vcdInt(p, st); }
+      else if (winInd & 0x02) { fromTarget = true; srcSegLen = vcdInt(p, st); srcSegPos = vcdInt(p, st); }
+      vcdInt(p, st); // skip delta encoding length
+      const tgtLen = vcdInt(p, st);
+      const del_ind = p[st.i++];
+      const dataSL = vcdInt(p, st);
+      const instSL = vcdInt(p, st);
+      const addrSL = vcdInt(p, st);
+      let winAdler = null;
+      if (winInd & 0x04) {
+        winAdler = ((p[st.i]<<24)|(p[st.i+1]<<16)|(p[st.i+2]<<8)|p[st.i+3])>>>0;
+        st.i += 4;
+      }
+
+      // Section byte boundaries in patch file
+      const dataPatchOff = st.i;
+      const instPatchOff = dataPatchOff + dataSL;
+      const addrPatchOff = instPatchOff + instSL;
+
+      // For each section: if compressed, strip vint prefix and collect raw XZ bytes
+      let dDecomp = dataSL, iDecomp = instSL, aDecomp = addrSL;
+      if (del_ind & 0x01) {
+        const s2 = { i: dataPatchOff };
+        dDecomp = vcdInt(p, s2);
+        cData.push(p.subarray(s2.i, dataPatchOff + dataSL));
+      }
+      if (del_ind & 0x02) {
+        const s2 = { i: instPatchOff };
+        iDecomp = vcdInt(p, s2);
+        cInst.push(p.subarray(s2.i, instPatchOff + instSL));
+      }
+      if (del_ind & 0x04) {
+        const s2 = { i: addrPatchOff };
+        aDecomp = vcdInt(p, s2);
+        cAddr.push(p.subarray(s2.i, addrPatchOff + addrSL));
+      }
+
+      metas.push({
+        winInd, srcSegLen, srcSegPos, fromSource, fromTarget, tgtLen, winAdler, del_ind,
+        dataPatchOff, instPatchOff, addrPatchOff,
+        dataSL, instSL, addrSL,
+        dDecomp, iDecomp, aDecomp,
+      });
+      st.i = addrPatchOff + addrSL;
+    }
+
+    // Decompress the three XZ streams (each is the concatenation of all per-window chunks)
+    const decData = cData.length ? new Uint8Array(await decompress(cat(cData))) : new Uint8Array(0);
+    const decInst = cInst.length ? new Uint8Array(await decompress(cat(cInst))) : new Uint8Array(0);
+    const decAddr = cAddr.length ? new Uint8Array(await decompress(cat(cAddr))) : new Uint8Array(0);
+
+    // === PASS 2: apply each window using the decompressed section data ===
+    const out = [];
+    let outLen = 0;
+    let dOff = 0, iOff = 0, aOff = 0;
+
+    for (const m of metas) {
+      const dataBytes = (m.del_ind & 0x01)
+        ? decData.subarray(dOff, dOff + m.dDecomp)
+        : p.subarray(m.dataPatchOff, m.dataPatchOff + m.dataSL);
+      const instBytes = (m.del_ind & 0x02)
+        ? decInst.subarray(iOff, iOff + m.iDecomp)
+        : p.subarray(m.instPatchOff, m.instPatchOff + m.instSL);
+      const addrBytes = (m.del_ind & 0x04)
+        ? decAddr.subarray(aOff, aOff + m.aDecomp)
+        : p.subarray(m.addrPatchOff, m.addrPatchOff + m.addrSL);
+
+      if (m.del_ind & 0x01) dOff += m.dDecomp;
+      if (m.del_ind & 0x02) iOff += m.iDecomp;
+      if (m.del_ind & 0x04) aOff += m.aDecomp;
+
+      const tgt = applyWindow(
+        src, dataBytes, instBytes, addrBytes,
+        m.srcSegLen, m.srcSegPos, m.fromSource, m.fromTarget,
+        m.tgtLen, m.winAdler, out, outLen, warn
+      );
+      out.push(tgt);
+      outLen += tgt.length;
+    }
+
+    return { buffer: flatten(out, outLen).buffer, warnings: warn };
+  }
+
+  // ---- Non-LZMA xdelta path ----
+  async function applyXDelta(romBuf, patchBuf) {
+    const src = new Uint8Array(romBuf), p = new Uint8Array(patchBuf);
+    const warn = [];
+    if (!(p[0] === 0xD6 && p[1] === 0xC3 && p[2] === 0xC4)) throw new Error("Not a valid xdelta3/VCDIFF patch");
+    const st = { i: 4 }; // skip magic (3 bytes) + version byte
+    const hdr = p[st.i++];
+
+    // If secondary compressor declared, read its ID byte
+    let secondaryId = 0;
+    if (hdr & 0x01) secondaryId = p[st.i++];
+    if (hdr & 0x02) throw new Error("Patch uses a custom VCDIFF code table — not supported");
+    if (hdr & 0x04) { const len = vcdInt(p, st); st.i += len; } // skip app header
+
+    // Route to LZMA path when secondary compressor is present
+    if (hdr & 0x01) {
+      if (secondaryId !== 2) throw new Error(`Secondary compressor ID ${secondaryId} not supported (only LZMA=2)`);
+      return await applyXDeltaLZMA(src, p, st.i, warn);
+    }
+
+    // ---- Standard uncompressed VCDIFF path ----
+    const out = [];
+    let outLen = 0;
+
+    while (st.i < p.length) {
+      const winInd = p[st.i++];
+      let srcSegLen = 0, srcSegPos = 0, fromSource = false, fromTarget = false;
+      if (winInd & 0x01) { fromSource = true; srcSegLen = vcdInt(p, st); srcSegPos = vcdInt(p, st); }
+      else if (winInd & 0x02) { fromTarget = true; srcSegLen = vcdInt(p, st); srcSegPos = vcdInt(p, st); }
+      vcdInt(p, st); // delta encoding length (unused)
+      const tgtLen = vcdInt(p, st);
+      const deltaInd = p[st.i++];
+      if (deltaInd & 0x07) throw new Error("Per-section compression in VCDIFF window — not supported");
+      const dataLen = vcdInt(p, st), instLen = vcdInt(p, st), addrLen = vcdInt(p, st);
+      let winAdler = null;
+      if (winInd & 0x04) {
+        winAdler = ((p[st.i] << 24) | (p[st.i+1] << 16) | (p[st.i+2] << 8) | p[st.i+3]) >>> 0;
+        st.i += 4;
+      }
+      const dataBytes = p.subarray(st.i, st.i + dataLen);
+      const instBytes = p.subarray(st.i + dataLen, st.i + dataLen + instLen);
+      const addrBytes = p.subarray(st.i + dataLen + instLen, st.i + dataLen + instLen + addrLen);
+      st.i += dataLen + instLen + addrLen;
+
+      const tgt = applyWindow(
+        src, dataBytes, instBytes, addrBytes,
+        srcSegLen, srcSegPos, fromSource, fromTarget,
+        tgtLen, winAdler, out, outLen, warn
+      );
+      out.push(tgt);
+      outLen += tgt.length;
+    }
+    return { buffer: flatten(out, outLen).buffer, warnings: warn };
+  }
+
+  async function apply(romBuf, patchBuf, patchName) {
+    const ext = (patchName.split(".").pop() || "").toLowerCase();
+    if (ext === "ips") return { buffer: applyIPS(romBuf, patchBuf), warnings: [] };
+    if (ext === "ups") return applyUPS(romBuf, patchBuf);
+    if (ext === "bps") return applyBPS(romBuf, patchBuf);
+    if (["xdelta", "xdelta3", "xd3", "vcdiff", "vcd"].includes(ext)) return applyXDelta(romBuf, patchBuf);
+    // sniff magic
+    const u = new Uint8Array(patchBuf, 0, 5);
+    const m = String.fromCharCode(...u);
+    if (m.startsWith("PATCH")) return { buffer: applyIPS(romBuf, patchBuf), warnings: [] };
+    if (m.startsWith("UPS1")) return applyUPS(romBuf, patchBuf);
+    if (m.startsWith("BPS1")) return applyBPS(romBuf, patchBuf);
+    if (u[0] === 0xD6 && u[1] === 0xC3 && u[2] === 0xC4) return applyXDelta(romBuf, patchBuf);
+    throw new Error("Unsupported patch format (use .ips, .ups, .bps or .xdelta)");
+  }
+
+  return { apply, crc32 };
+})();
